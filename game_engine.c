@@ -13,6 +13,7 @@ GameEngineSettings game_engine_settings_init() {
     settings.show_fps = false;
     settings.always_backlight = true;
     settings.start_callback = NULL;
+    settings.pre_canvas_callback = NULL;
     settings.frame_callback = NULL;
     settings.stop_callback = NULL;
     settings.context = NULL;
@@ -23,17 +24,50 @@ struct GameEngine {
     Gui* gui;
     NotificationApp* notifications;
     FuriPubSub* input_pubsub;
+    FuriThread* canvas_render_thread;
+    FuriEventFlag* canvas_ready_flag;
     FuriThreadId thread_id;
     GameEngineSettings settings;
     float fps;
 };
 
+typedef struct {
+    FuriEventFlag* rendering_done_flag;
+    Canvas* canvas;
+} RenderThreadContext;
+
 typedef enum {
     GameThreadFlagUpdate = 1 << 0,
     GameThreadFlagStop = 1 << 1,
 } GameThreadFlag;
-
 #define GameThreadFlagMask (GameThreadFlagUpdate | GameThreadFlagStop)
+
+typedef enum {
+    RenderThreadFlagReady = 1 << 0,
+    RenderThreadFlagStop = 1 << 1,
+} RenderThreadFlag;
+#define RenderThreadFlagMask (RenderThreadFlagReady | RenderThreadFlagStop)
+
+static int32_t canvas_render_thread(void* context) {
+    RenderThreadContext* render_thread_context = (RenderThreadContext*)context;
+
+    while(true) {
+        uint32_t flags =
+            furi_thread_flags_wait(RenderThreadFlagMask, FuriFlagWaitAny, FuriWaitForever);
+        furi_check((flags & FuriFlagError) == 0);
+
+        if(flags & RenderThreadFlagReady) {
+            canvas_commit(render_thread_context->canvas);
+            furi_event_flag_set(render_thread_context->rendering_done_flag, RenderThreadFlagReady);
+        }
+
+        if(flags & RenderThreadFlagStop) {
+            break;
+        }
+    }
+
+    return 0;
+}
 
 GameEngine* game_engine_alloc(GameEngineSettings settings) {
     furi_check(settings.frame_callback != NULL);
@@ -42,6 +76,9 @@ GameEngine* game_engine_alloc(GameEngineSettings settings) {
     engine->gui = furi_record_open(RECORD_GUI);
     engine->notifications = furi_record_open(RECORD_NOTIFICATION);
     engine->input_pubsub = furi_record_open(RECORD_INPUT_EVENTS);
+    engine->canvas_ready_flag = furi_event_flag_alloc();
+    engine->canvas_render_thread =
+        furi_thread_alloc_ex("RenderThread", 1024, canvas_render_thread, NULL);
     engine->thread_id = furi_thread_get_current_id();
     engine->settings = settings;
     engine->fps = 1.0f;
@@ -53,6 +90,10 @@ void game_engine_free(GameEngine* engine) {
     furi_record_close(RECORD_GUI);
     furi_record_close(RECORD_NOTIFICATION);
     furi_record_close(RECORD_INPUT_EVENTS);
+
+    furi_event_flag_free(engine->canvas_ready_flag);
+    furi_thread_free(engine->canvas_render_thread);
+
     free(engine);
 }
 
@@ -103,6 +144,14 @@ void game_engine_run(GameEngine* engine) {
     // acquire gui canvas
     Canvas* canvas = gui_direct_draw_acquire(engine->gui);
 
+    RenderThreadContext render_context = {
+        .rendering_done_flag = engine->canvas_ready_flag,
+        .canvas = canvas,
+    };
+    furi_thread_set_context(engine->canvas_render_thread, &render_context);
+    furi_thread_start(engine->canvas_render_thread);
+    furi_event_flag_set(engine->canvas_ready_flag, RenderThreadFlagReady);
+
     // subscribe to input events
     FuriPubSubSubscription* input_subscription =
         furi_pubsub_subscribe(engine->input_pubsub, input_events_callback, &input_state);
@@ -138,11 +187,21 @@ void game_engine_run(GameEngine* engine) {
             };
             input_prev_state = input_current_state;
 
+            engine->settings.pre_canvas_callback(engine, NULL, input, engine->settings.context);
+
             // clear screen
             canvas_reset(canvas);
 
             // calculate actual fps
             engine->fps = (float)SystemCoreClock / time_delta;
+
+            const uint32_t canvas_ready_flags = furi_event_flag_wait(
+                engine->canvas_ready_flag, RenderThreadFlagMask, FuriFlagWaitAny, FuriWaitForever);
+            furi_check((flags & FuriFlagError) == 0);
+
+            if(canvas_ready_flags & RenderThreadFlagStop) {
+                break;
+            }
 
             // do the work
             engine->settings.frame_callback(engine, canvas, input, engine->settings.context);
@@ -154,7 +213,8 @@ void game_engine_run(GameEngine* engine) {
             }
 
             // and output screen buffer
-            canvas_commit(canvas);
+            furi_thread_flags_set(
+                furi_thread_get_id(engine->canvas_render_thread), RenderThreadFlagReady);
 
             // throttle a bit
             furi_delay_tick(2);
@@ -184,6 +244,10 @@ void game_engine_run(GameEngine* engine) {
 
 void game_engine_stop(GameEngine* engine) {
     furi_thread_flags_set(engine->thread_id, GameThreadFlagStop);
+
+    furi_event_flag_set(engine->canvas_ready_flag, RenderThreadFlagStop);
+    furi_thread_flags_set(furi_thread_get_id(engine->canvas_render_thread), RenderThreadFlagStop);
+    furi_thread_join(engine->canvas_render_thread);
 }
 
 float game_engine_get_delta_time(GameEngine* engine) {
